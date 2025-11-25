@@ -259,23 +259,17 @@ function fmtUnitsPrec(amount, decimals, precision = 4) {
   }
 }
 
-async function fetchMarket(targetId = null) {
+async function fetchMarket() {
   const url = `https://api.limitless.exchange/markets/active/0`;
   const res = await axios.get(url, { timeout: 15000 });
   const payload = res.data;
-  // Normalize different API shapes: older endpoints may return { market: ... }, newer endpoints return { data: [ ... ] }
-  if (payload && payload.market) {
-    // keep existing shape for backward compatibility
-    return payload;
-  }
-  targetId = 21836
   if (payload && Array.isArray(payload.data)) {
-    // If caller provided a target ID, search the list and return the matching object (or null)
-    if (targetId != null) {
-      const found = payload.data.find(m => String(m.id) === String(targetId));
-      return found || null;
-    }
+    const found = payload.data.find(
+      m => Array.isArray(m.tags) && m.tags.includes('Hourly') && m.tradeType === 'amm'
+    );
+    return found || null;
   }
+  return null;
 }
 async function readAllowance(usdc, owner, spender) {
   // Try normal call, then staticCall as fallback
