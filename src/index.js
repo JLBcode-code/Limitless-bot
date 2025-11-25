@@ -486,7 +486,7 @@ async function runForWallet(wallet, provider) {
         return;
       }
 
-      const marketInfo = data.market;
+      const marketInfo = data;
       // Log market title to console for visibility
       if (marketInfo && marketInfo.title) {
         logInfo('📰', `市场标题: ${marketInfo.title}`);
