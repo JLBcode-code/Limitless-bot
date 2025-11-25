@@ -259,12 +259,24 @@ function fmtUnitsPrec(amount, decimals, precision = 4) {
   }
 }
 
-async function fetchMarket() {
-  const url = `https://api.limitless.exchange/markets/prophet?priceOracleId=${PRICE_ORACLE_ID}&frequency=${FREQUENCY}`;
+async function fetchMarket(targetId = null) {
+  const url = `https://api.limitless.exchange/markets/active/0`;
   const res = await axios.get(url, { timeout: 15000 });
-  return res.data;
+  const payload = res.data;
+  // Normalize different API shapes: older endpoints may return { market: ... }, newer endpoints return { data: [ ... ] }
+  if (payload && payload.market) {
+    // keep existing shape for backward compatibility
+    return payload;
+  }
+  targetId = 21836
+  if (payload && Array.isArray(payload.data)) {
+    // If caller provided a target ID, search the list and return the matching object (or null)
+    if (targetId != null) {
+      const found = payload.data.find(m => String(m.id) === String(targetId));
+      return found || null;
+    }
+  }
 }
-
 async function readAllowance(usdc, owner, spender) {
   // Try normal call, then staticCall as fallback
   try {
@@ -469,7 +481,7 @@ async function runForWallet(wallet, provider) {
   async function tick() {
     try {
       const data = await fetchMarket();
-      if (!data || !data.market || !data.market.address || !data.isActive) {
+      if (!data || !data.address || data.expired) {
         logWarn('⏸️', '市场未开启或数据丢失');
         return;
       }
