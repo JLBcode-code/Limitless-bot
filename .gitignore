@@ -4,8 +4,7 @@ node_modules/
 /yarn-debug.log*
 /yarn-error.log*
 
-# dotenv
-.env
+
 
 # Data and runtime
 data/state.json
