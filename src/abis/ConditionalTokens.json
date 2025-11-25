@@ -1,0 +1,28 @@
+[
+  {
+    "constant": false,
+    "inputs": [
+      {
+        "name": "collateralToken",
+        "type": "address"
+      },
+      {
+        "name": "parentCollectionId",
+        "type": "bytes32"
+      },
+      {
+        "name": "conditionId",
+        "type": "bytes32"
+      },
+      {
+        "name": "indexSets",
+        "type": "uint256[]"
+      }
+    ],
+    "name": "redeemPositions",
+    "outputs": [],
+    "payable": false,
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+]
