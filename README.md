@@ -9,6 +9,8 @@ Limitless官网链接：https://limitless.exchange/?r=3840Y1I1T2
 
 ⚡ 简介
 
+V1.10.8:更新内容添加15分钟，30分钟，小时场次，在.env文件中FREQUENCY=Minutes 15参数代表对应场次名称，新增MIN_MARKET_AGE_MIN(开盘后入场时间限制)设定10也就是在开盘后10分钟再寻找下单机会
+
 这是一个用于 Limitless 预测市场的自动交易机器人（刷分/做市/示例交易策略），内置了两个简单策略：
 
 - dominant：当某一方价格 >= TRIGGER_PCT（默认 60）时购买该方；
