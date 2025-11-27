@@ -82,7 +82,6 @@ const CHAIN_ID = parseInt(process.env.CHAIN_ID || '8453', 10);
 const PRICE_ORACLE_ID = process.env.PRICE_ORACLE_ID;
 const FREQUENCY = process.env.FREQUENCY || 'hourly';
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
-const CLAIMS_INTERVAL_MS = parseInt(process.env.CLAIMS_INTERVAL_MS || '60000', 10);
 const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 5; // human units
 const TARGET_PROFIT_PCT = process.env.TARGET_PROFIT_PCT ? Number(process.env.TARGET_PROFIT_PCT) : 20; // 20%
 const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 100; // 1%
@@ -91,7 +90,8 @@ const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '1', 10);
 const STRATEGY_MODE = (process.env.STRATEGY_MODE || 'dominant').toLowerCase();
 const TRIGGER_PCT = process.env.TRIGGER_PCT ? Number(process.env.TRIGGER_PCT) : 60;
 const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND) : 5;
-const LOOKBACK_BLOCKS = parseInt(process.env.LOOKBACK_BLOCKS || '500000', 10);
+const MIN_MARKET_AGE_MIN = parseInt(process.env.MIN_MARKET_AGE_MIN || '5', 10); // minutes to wait after market creation before betting
+const MAX_MARKET_AGE_MIN = parseInt(process.env.MAX_MARKET_AGE_MIN || '5', 10);
 
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
 const CALC_SELL_DECIMALS = 8; // calcSellAmount returns values scaled by 1e8 per spec
@@ -136,6 +136,7 @@ async function txOverrides(provider, gasLimit) {
 
 // In-memory state: per-user cost basis to compute PnL
 const userState = new Map(); // key: wallet.address, value: { holding: { marketAddress, outcomeIndex, tokenId: bigint, amount: bigint, cost: bigint } | null, completedMarkets: Set<string> }
+const pendingState = new Map(); // key: wallet.address, value: { buy: boolean, sell: boolean }
 
 // [Removed duplicate logging helpers -- defined earlier]
 
@@ -159,6 +160,19 @@ function markMarketCompleted(addr, marketAddress) {
   set.add(marketAddress.toLowerCase());
   userState.set(addr, { ...prev, completedMarkets: set });
   scheduleSave();
+}
+
+function getPendingFlags(addr) {
+  const existing = pendingState.get(addr);
+  if (existing) return existing;
+  const created = { buy: false, sell: false };
+  pendingState.set(addr, created);
+  return created;
+}
+function setPendingFlag(addr, key, value) {
+  const current = getPendingFlags(addr);
+  const next = { ...current, [key]: value };
+  pendingState.set(addr, next);
 }
 
 // ========= Persistence =========
@@ -240,6 +254,19 @@ function delay(ms) {
   return new Promise(res => setTimeout(res, ms));
 }
 
+// Normalize timestamps that may be in seconds or milliseconds to ms
+function toMs(tsLike) {
+  if (tsLike == null) return NaN;
+  // If numeric (string or number)
+  const n = Number(tsLike);
+  if (!Number.isNaN(n)) {
+    // Heuristic: seconds are < 1e12 for current epoch, ms are >= 1e12
+    return n < 1e12 ? n * 1000 : n;
+  }
+  const d = new Date(tsLike);
+  return d.getTime();
+}
+
 async function safeBalanceOf(erc1155, owner, tokenId) {
   try {
     return await erc1155.balanceOf(owner, tokenId);
@@ -264,13 +291,20 @@ async function fetchMarket() {
   const res = await axios.get(url, { timeout: 15000 });
   const payload = res.data;
   if (payload && Array.isArray(payload.data)) {
+    const freqTag = FREQUENCY || 'Hourly';
     const found = payload.data.find(
-      m => Array.isArray(m.tags) && m.tags.includes('Hourly') && m.tradeType === 'amm'
+      m =>
+        Array.isArray(m.tags) &&
+        m.tags.some(tag => String(tag).toLowerCase() === String(freqTag).toLowerCase()) &&
+        m.tradeType === 'amm'
     );
+    // console.log(found);
     return found || null;
   }
   return null;
 }
+
+
 async function readAllowance(usdc, owner, spender) {
   // Try normal call, then staticCall as fallback
   try {
@@ -311,7 +345,7 @@ async function ensureUsdcApproval(wallet, usdc, marketAddress, needed) {
     logInfo('🔎', `检查USDC授权 ${marketAddress} ...`);
     current = await readAllowance(usdc, wallet.address, marketAddress);
   } catch (e) {
-    logWarn('⚠️', `Allowance read failed. Will try to approve, then re-check. Details: ${(e && e.message) ? e.message : e}`);
+    logWarn('⚠️', `授权读取失败，将尝试批准, then re-check. Details: ${(e && e.message) ? e.message : e}`);
     current = 0n;
   }
   if (current >= needed) return true;
@@ -340,7 +374,7 @@ async function ensureUsdcApproval(wallet, usdc, marketAddress, needed) {
     logInfo('🧾', `approve tx: ${tx.hash}`);
     await tx.wait(CONFIRMATIONS);
   } catch (e) {
-    // Fallback: try increaseAllowance if approve fails (some tokens prefer increasing)
+    // Fallback: 如果批准失败，尝试增加权限。 (some tokens prefer increasing)
     logWarn('⚠️', `授权失败, trying increaseAllowance. Details: ${(e && e.message) ? e.message : e}`);
     try {
       const gasEst2 = await estimateGasFor(usdc, wallet, 'increaseAllowance', [marketAddress, needed]);
@@ -351,7 +385,7 @@ async function ensureUsdcApproval(wallet, usdc, marketAddress, needed) {
       logInfo('🧾', `increaseAllowance tx: ${tx2.hash}`);
       await tx2.wait(CONFIRMATIONS);
     } catch (e2) {
-      logErr('💥', 'increaseAllowance also failed', (e2 && e2.message) ? e2.message : e2);
+      logErr('💥', '增加授权依然失败', (e2 && e2.message) ? e2.message : e2);
       return false;
     }
   }
@@ -371,7 +405,7 @@ async function ensureErc1155Approval(wallet, erc1155, operator) {
   // Try to read approval state up to 3 times
   for (let i = 0; i < 3; i++) {
     try {
-      logInfo('🔎', `Checking ERC1155 isApprovedForAll(${wallet.address}, ${operator}) ...`);
+      logInfo('🔎', `检查 ERC1155 是否授权(${wallet.address}, ${operator}) ...`);
       const approved = await erc1155.isApprovedForAll(wallet.address, operator);
       if (approved) return true; // already approved
       break; // definite false -> proceed to approve
@@ -497,24 +531,27 @@ async function runForWallet(wallet, provider) {
       //市场结束时间常量
       let nearDeadlineForBet = false;
       if (marketInfo.createdAt) {
-        const createdMs = new Date(marketInfo.createdAt).getTime();
+        const createdMs = toMs(marketInfo.createdAt);
         if (!Number.isNaN(createdMs)) {
           const ageMs = nowMs - createdMs;
-          if (ageMs < 10 * 60 * 1000) {
+          const minAgeMs = Math.max(0, MIN_MARKET_AGE_MIN) * 60 * 1000;
+          if (ageMs < minAgeMs) {
             tooNewForBet = true;
             const ageMin = Math.max(0, Math.floor(ageMs / 60000));
-            logInfo('⏳', ` 市场开启 ${ageMin}分钟 小于 10分钟 — 跳过 betting`);
+            logInfo('⏳', ` 市场开启 ${ageMin}分钟 小于 ${MIN_MARKET_AGE_MIN}分钟 — 跳过 betting`);
           }
         }
       }
       if (marketInfo.deadline) {
-        const deadlineMs = new Date(marketInfo.deadline).getTime();
+        const deadlineMs = toMs(marketInfo.deadline);
         if (!Number.isNaN(deadlineMs)) {
           const remainingMs = deadlineMs - nowMs;
-          if (remainingMs < 5 * 60 * 1000) {
+          const maxAgeMs = Math.max(0, MAX_MARKET_AGE_MIN) * 60 * 1000;
+          //扫尾盘参数
+          if (remainingMs < maxAgeMs) {
             nearDeadlineForBet = true;
             const remMin = Math.max(0, Math.floor(remainingMs / 60000));
-            logInfo('⏳', `临近截止日期 ${remMin}m < 5m — 跳过下注`);
+            logInfo('⏳', `临近截止日期 ${remMin}m < ${MAX_MARKET_AGE_MIN} — 跳过下注`);
           }
         }
       }
@@ -540,6 +577,13 @@ async function runForWallet(wallet, provider) {
           logErr('❌', `USDC address has no code on this chain: ${collateralTokenAddress}. Check RPC/network.`);
           return;
         }
+        // 新市场首次加载时，提前授权本次买入金额，避免后续每笔重复授权
+        const bootstrapApproveAmount = ethers.parseUnits(BUY_AMOUNT_USDC.toString(), decimals);
+        const approvedAtLoad = await ensureUsdcApproval(wallet, usdc, marketAddress, bootstrapApproveAmount);
+        if (!approvedAtLoad) {
+          logWarn('🛑', `初次授权 USDC 给市场 ${marketAddress} 失败，跳过本轮。`);
+          return;
+        }
         cachedContracts = { market, usdc, erc1155, decimals };
         lastMarketAddr = marketAddress;
         logInfo('🧩', `已加载合约: market=${marketAddress}, usdc=${collateralTokenAddress}, erc1155=${conditionalTokensAddress}, usdcDecimals=${decimals}`);
@@ -547,7 +591,7 @@ async function runForWallet(wallet, provider) {
 
       const { market, usdc, erc1155, decimals } = cachedContracts;
 
-      // 检查用户是否已持有仓位 (either outcome token)
+      // 检查用户是否已持有仓位
       const localHolding = getHolding(wallet.address);
       const localHoldingThisMarket = localHolding && localHolding.marketAddress === marketAddress ? localHolding : null;
       const pid0 = positionIds[0] ? BigInt(positionIds[0]) : null;
@@ -592,7 +636,7 @@ async function runForWallet(wallet, provider) {
           return;
         }
         if (tokensNeededForCost === 0n) {
-          logWarn('⚠️', 'calcSellAmount returned 0 for cost; skipping PnL calc this tick.');
+          logWarn('⚠️', 'calcSellAmount 返回 0 for cost; skipping PnL calc this tick.');
           return;
         }
         const positionValue = (tokenBalance * cost) / tokensNeededForCost; // floor
@@ -604,31 +648,41 @@ async function runForWallet(wallet, provider) {
         const pnlAbsHuman = fmtUnitsPrec(pnlAbs >= 0n ? pnlAbs : -pnlAbs, decimals, 4);
         logInfo('📈', `持有的 tokenId=${tokenId} 余额=${tokenBalance} 仓位价值=${valueHuman} 收益率 PnL≈${pnlPct.toFixed(2)}% ${signEmoji} ${pnlAbsHuman} USDC`);
         if (pnlAbs > 0n && pnlPct >= TARGET_PROFIT_PCT) {
-          const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
-          if (!approvedOk) {
-            logWarn('🛑', 'Approval not confirmed; skipping sell this tick.');
+          const pend = getPendingFlags(wallet.address);
+          if (pend.sell) {
+            logInfo('⏸️', '已有卖出在进行中，跳过本次卖出。');
             return;
           }
-          // Only proceed if gas estimation works
-          // Per spec: sell with maxOutcomeTokensToSell == balance; returnAmount reduced by 1% fee safety
-          const maxOutcomeTokensToSell = tokenBalance;
-          const returnAmountForSell = positionValue - (positionValue / 100n); // minus 1% safety
-          // const returnAmountForSell = positionValue
-          const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
-          if (!gasEst) {
-            logWarn('🛑', 'GAS估价卖出失败；跳过本次卖出。');
+          setPendingFlag(wallet.address, 'sell', true);
+          try {
+            const approvedOk = await ensureErc1155Approval(wallet, erc1155, marketAddress);
+            if (!approvedOk) {
+              logWarn('🛑', 'Approval not confirmed; skipping sell this tick.');
+              return;
+            }
+            // Only proceed if gas estimation works
+            // Per spec: sell with maxOutcomeTokensToSell == balance; returnAmount reduced by 1% fee safety
+            const maxOutcomeTokensToSell = tokenBalance;
+            const returnAmountForSell = positionValue - (positionValue / 100n); // minus 1% safety
+            // const returnAmountForSell = positionValue
+            const gasEst = await estimateGasFor(market, wallet, 'sell', [returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell]);
+            if (!gasEst) {
+              logWarn('🛑', 'GAS估价卖出失败；跳过本次卖出。');
+              return;
+            }
+            logInfo('⛽', `Gas estimate sell: ${gasEst}`);
+            const padded = (gasEst * 120n) / 100n + 10000n;
+            const sellOv = await txOverrides(wallet.provider, padded);
+            const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
+            logInfo('🧾', `Sell tx: ${tx.hash}`);
+            await tx.wait(CONFIRMATIONS);
+            logInfo('✅', '卖出完成.');
+            setHolding(wallet.address, null);
+            markMarketCompleted(wallet.address, marketAddress);
             return;
+          } finally {
+            setPendingFlag(wallet.address, 'sell', false);
           }
-          logInfo('⛽', `Gas estimate sell: ${gasEst}`);
-          const padded = (gasEst * 120n) / 100n + 10000n;
-          const sellOv = await txOverrides(wallet.provider, padded);
-          const tx = await market.sell(returnAmountForSell, outcomeIndex, maxOutcomeTokensToSell, sellOv);
-          logInfo('🧾', `Sell tx: ${tx.hash}`);
-          await tx.wait(CONFIRMATIONS);
-          logInfo('✅', '卖出完成.');
-          setHolding(wallet.address, null);
-          markMarketCompleted(wallet.address, marketAddress);
-          return;
         }
 
         // Already holding; do not buy more
@@ -662,71 +716,93 @@ async function runForWallet(wallet, provider) {
 
       const outcomeToBuy = pickOutcome(prices);
       if (outcomeToBuy === null) {
-        logInfo('🔎', `No trigger (mode=${STRATEGY_MODE}, prices=${prices.join(', ')}).`);
+        logInfo('🔎', `没有适合下注的仓位 (mode=${STRATEGY_MODE}, prices=${prices.join(', ')}).`);
         return;
       }
 
-      const investmentHuman = BUY_AMOUNT_USDC;
-      const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
-
-      // 先检查余额是否充足
-      const usdcBal = await usdc.balanceOf(wallet.address);
-      const usdcBalHuman = ethers.formatUnits(usdcBal, decimals);
-      const needHuman = ethers.formatUnits(investment, decimals);
-      logInfo('💰', `USDC 余额=${usdcBalHuman}, need=${needHuman} for buy`);
-      if (usdcBal < investment) {
-        logWarn('⚠️', `USDC不足`);
+      const pend = getPendingFlags(wallet.address);
+      if (pend.buy) {
+        logInfo('⏸️', '已有买入在进行中，跳过本次买入。');
+        return;
+      }
+      if (pend.sell) {
+        logInfo('⏸️', '当前有卖出在进行，跳过买入以避免并发。');
         return;
       }
 
-      // Ensure USDC allowance
-      const allowanceOk = await ensureUsdcApproval(wallet, usdc, marketAddress, investment);
-      if (!allowanceOk) {
-        logWarn('🛑', 'USDC未授权. Skip buy this tick.');
-        return;
-      }
-
-      // 通过 calcBuyAmount 和滑点计算 minOutcomeTokensToBuy
-      const expectedTokens = await market.calcBuyAmount(investment, outcomeToBuy);
-      const minOutcomeTokensToBuy = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
-      logInfo('🛒', `触发策略生效 (mode=${STRATEGY_MODE}). Buying outcome=${outcomeToBuy} invest=${investment} minTokens=${minOutcomeTokensToBuy}`);
-
-      // Estimate gas then buy
-      const gasEst = await estimateGasFor(market, wallet, 'buy', [investment, outcomeToBuy, minOutcomeTokensToBuy]);
-      if (!gasEst) {
-        logWarn('🛑', 'GAS估算失败; skipping buy this tick.');
-        return;
-      }
-      logInfo('⛽', `Gas estimate buy: ${gasEst}`);
-      const padded = (gasEst * 120n) / 100n + 10000n;
-      const buyOv = await txOverrides(wallet.provider, padded);
-      const buyTx = await market.buy(investment, outcomeToBuy, minOutcomeTokensToBuy, buyOv);
-      logInfo('🧾', `Buy tx: ${buyTx.hash}`);
-      const receipt = await buyTx.wait(CONFIRMATIONS);
-      logInfo('✅', `Buy completed in block ${receipt.blockNumber}`);
-
-      const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
-      // After buy, record cost basis
-      setHolding(wallet.address, {
-        marketAddress,
-        outcomeIndex: outcomeToBuy,
-        tokenId,
-        amount: investment,
-        cost: investment
-      });
-      // Try to confirm on-chain ERC1155 balance right away (best-effort)
-      // Try to confirm on-chain ERC1155 balance right away (best-effort with retries)
+      setPendingFlag(wallet.address, 'buy', true);
       try {
-        let balNow = 0n;
-        for (let i = 0; i < 5; i++) {
-          balNow = await safeBalanceOf(erc1155, wallet.address, tokenId);
-          if (balNow > 0n) break;
-          await delay(1000);
+        const investmentHuman = BUY_AMOUNT_USDC;
+        const investment = ethers.parseUnits(investmentHuman.toString(), decimals);
+
+        // 先检查余额是否充足
+        const usdcBal = await usdc.balanceOf(wallet.address);
+        const usdcBalHuman = ethers.formatUnits(usdcBal, decimals);
+        const needHuman = ethers.formatUnits(investment, decimals);
+        logInfo('💰', `USDC 余额=${usdcBalHuman}, need=${needHuman} for buy`);
+        if (usdcBal < investment) {
+          logWarn('⚠️', `USDC不足`);
+          return;
         }
-        logInfo('🎟️', `买入后的仓位余额: ${balNow}`);
-      } catch (e) {
-        logWarn('⚠️', `Failed to read position balance after buy: ${(e && e.message) ? e.message : e}`);
+
+        // Ensure USDC allowance
+        const allowanceOk = await ensureUsdcApproval(wallet, usdc, marketAddress, investment);
+        if (!allowanceOk) {
+          logWarn('🛑', 'USDC未授权 Skip buy this tick.');
+          return;
+        }
+
+        // 通过 calcBuyAmount 和滑点计算 minOutcomeTokensToBuy
+        const expectedTokens = await market.calcBuyAmount(investment, outcomeToBuy);
+        const minOutcomeTokensToBuy = expectedTokens - (expectedTokens * BigInt(SLIPPAGE_BPS)) / 10000n;
+        logInfo('🛒', `触发策略生效 (mode=${STRATEGY_MODE}). Buying outcome=${outcomeToBuy} invest=${investment} minTokens=${minOutcomeTokensToBuy}`);
+
+        // Estimate gas then buy
+        const gasEst = await estimateGasFor(market, wallet, 'buy', [investment, outcomeToBuy, minOutcomeTokensToBuy]);
+        if (!gasEst) {
+          logWarn('🛑', 'GAS估算失败; skipping buy this tick.');
+          return;
+        }
+        logInfo('⛽', `Gas estimate buy: ${gasEst}`);
+        const padded = (gasEst * 120n) / 100n + 10000n;
+        const buyOv = await txOverrides(wallet.provider, padded);
+        const buyTx = await market.buy(investment, outcomeToBuy, minOutcomeTokensToBuy, buyOv);
+        logInfo('🧾', `Buy tx: ${buyTx.hash}`);
+        const receipt = await buyTx.wait(CONFIRMATIONS);
+        logInfo('✅', `Buy completed in block ${receipt.blockNumber}`);
+
+        const tokenId = outcomeToBuy === 0 ? pid0 : pid1;
+        // After buy, record cost basis
+        setHolding(wallet.address, {
+          marketAddress,
+          outcomeIndex: outcomeToBuy,
+          tokenId,
+          amount: investment,
+          cost: investment
+        });
+        // Try to confirm on-chain ERC1155 balance right away (best-effort)
+        try {
+          let balNow = 0n;
+          for (let i = 0; i < 5; i++) {
+            balNow = await safeBalanceOf(erc1155, wallet.address, tokenId);
+            if (balNow > 0n) break;
+            await delay(1000);
+          }
+          logInfo('🎟️', `买入后的仓位余额: ${balNow}`);
+          // 买入后立刻授权 ERC1155 给市场合约，避免卖出时再单独授权
+          const erc1155Approved = await ensureErc1155Approval(wallet, erc1155, marketAddress);
+          if (!erc1155Approved) {
+            logWarn('⚠️', `买入后授权 ERC1155 给 ${marketAddress} 失败，后续卖出可能受阻。`);
+          } else {
+            logInfo('🔓', `已授权 ERC1155 给市场 ${marketAddress}`);
+          }
+        } catch (e) {
+          logWarn('⚠️', `Failed to read position balance after buy: ${(e && e.message) ? e.message : e}`);
+        }
+      } finally {
+        setPendingFlag(wallet.address, 'buy', false);
       }
+
     } catch (err) {
       logErr('💥', 'Error in tick:', err && err.message ? err.message : err);
     }
@@ -775,7 +851,7 @@ async function main() {
         holding: existing.holding || null,
         completedMarkets: existing.completedMarkets || new Set()
       });
-      logInfo('📂', `仓位读取: holding=${existing.holding ? 'yes' : 'no'}, completedMarkets=${(existing.completedMarkets || new Set()).size}`);
+      logInfo('📂', `仓位读取: 持仓=${existing.holding ? 'yes' : 'no'}, 已完成的订单=${(existing.completedMarkets || new Set()).size}`);
     } else {
       userState.set(w.address, { holding: null, completedMarkets: new Set() });
     }
@@ -786,11 +862,6 @@ async function main() {
     const timer = await runForWallet(w, provider);
     timers.push(timer);
   }
-
-  // for (const w of wallets) {
-  //   const timer = setInterval(() => claimRewards(w), CLAIMS_INTERVAL_MS);
-  //   timers.push(timer);
-  // }
   process.on('SIGINT', () => {
     logInfo('👋', 'Shutting down...');
     timers.forEach(t => clearInterval(t));
@@ -809,3 +880,4 @@ function scaleToCalcSell(amount, tokenDecimals) {
   if (d < target) return amount * (10n ** (target - d));
   return amount / (10n ** (d - target));
 }
+
