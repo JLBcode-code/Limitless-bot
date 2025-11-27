@@ -1,6 +1,7 @@
 # Limitless Bot — 内置策略的 Limitless 预测市场刷分交易脚本
 
-联系方式： https://t.me/Block_devp
+Telegram： https://t.me/Block_devp
+关注我的X：https://x.com/Jlbcode
 
 Limitless官网链接：https://limitless.exchange/?r=3840Y1I1T2
 
